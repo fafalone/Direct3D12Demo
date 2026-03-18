@@ -1,0 +1,755 @@
+Module DX12Cube
+    
+    ' -------------------------------------------------------------------------
+    ' Constants
+    ' -------------------------------------------------------------------------
+    Private Const FRAME_COUNT       As Long = 3
+    Private Const WINDOW_WIDTH      As Long = 1280
+    Private Const WINDOW_HEIGHT     As Long = 720
+    Private Const APP_TITLE         As String = "DX12 Rotating Cube"
+    Private Const PI                As Double = 3.14159265358979323846
+    Private Const wndClass          As String = "DX12CubeClass"
+    ' -------------------------------------------------------------------------
+    ' Vertex layout:  position (xyz) + colour (rgba) — 7 x Float32 = 28 bytes
+    ' -------------------------------------------------------------------------
+    Private Type Vertex
+        x As Single: y As Single: z As Single
+        r As Single: g As Single: b As Single: a As Single
+    End Type
+    Private m_SemanticPosition As String
+    Private m_SemanticColor    As String
+ 
+    ' -------------------------------------------------------------------------
+    ' Module-level D3D12 objects
+    ' -------------------------------------------------------------------------
+    Private m_hWnd              As LongPtr
+
+    Private m_Device            As ID3D12Device
+    Private m_CmdQueue          As ID3D12CommandQueue
+    Private m_SwapChain         As IDXGISwapChain3
+    Private m_RtvHeap           As ID3D12DescriptorHeap
+    Private m_DsvHeap           As ID3D12DescriptorHeap
+    Private m_DepthBuffer       As ID3D12Resource
+    Private m_RenderTargets(FRAME_COUNT - 1) As ID3D12Resource
+    Private m_CmdAllocators(FRAME_COUNT - 1) As ID3D12CommandAllocator
+    Private m_CmdList           As ID3D12GraphicsCommandList
+    Private m_RootSignature     As ID3D12RootSignature
+    Private m_Pso               As ID3D12PipelineState
+    Private m_VertexBuffer      As ID3D12Resource
+    Private m_IndexBuffer       As ID3D12Resource
+    Private m_ConstantBuffers(FRAME_COUNT - 1) As ID3D12Resource
+    Private m_Fence             As ID3D12Fence
+    Private m_FenceEvent        As LongPtr
+    Private m_FenceValues(FRAME_COUNT - 1) As LongLong
+
+    Private m_RtvDescSize       As Long
+    Private m_FrameIndex        As Long
+    Private m_RotationAngle     As Single
+
+    ' Persistent mapped pointers for the constant buffers
+    Private m_CbMappedPtr(FRAME_COUNT - 1) As LongPtr
+
+    ' -------------------------------------------------------------------------
+    ' Entry point
+    ' -------------------------------------------------------------------------
+    Sub Main()
+        m_hWnd = CreateAppWindow()
+        If m_hWnd = 0 Then
+            MsgBox "Failed to create window.", vbCritical
+            Exit Sub
+        End If
+        
+        Debug.Print "InitD3D12"
+        InitD3D12()
+        ShowWindow m_hWnd, SW_SHOW
+        UpdateWindow m_hWnd
+
+        RunMessageLoop()
+
+        WaitForGpu()
+        CloseHandle m_FenceEvent
+    End Sub
+
+    ' =========================================================================
+    ' Win32 Window
+    ' =========================================================================
+    Private Function CreateAppWindow() As LongPtr
+        Dim wc As WNDCLASSEX
+        wc.cbSize = LenB(wc)
+        wc.style = CS_HREDRAW Or CS_VREDRAW
+        wc.lpfnWndProc = AddressOf WndProc
+        wc.hInstance = GetModuleHandleW(0)
+        wc.hCursor = LoadCursor(0, IDC_ARROW)
+        wc.lpszClassName = StrPtr(wndClass)
+        RegisterClassEx(wc)
+
+        Dim rc As RECT
+        SetRect rc, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT
+        AdjustWindowRect rc, WS_OVERLAPPEDWINDOW, 0
+
+        CreateAppWindow = CreateWindowExW(0, StrPtr(wndClass), StrPtr(APP_TITLE), _
+                            WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, _
+                            rc.Right - rc.Left, rc.Bottom - rc.Top, 0, 0, _
+                            GetModuleHandle(vbNullString), ByVal 0)
+ 
+    End Function
+
+    Private Function WndProc(ByVal hWnd As LongPtr, ByVal uMsg As Long, _
+                             ByVal wParam As LongPtr, ByVal lParam As LongPtr) As LongPtr
+        Select Case uMsg
+        Case WM_DESTROY
+            PostQuitMessage 0
+            WndProc = 0
+        Case Else
+            WndProc = DefWindowProc(hWnd, uMsg, wParam, lParam)
+        End Select
+    End Function
+
+    Private Sub RunMessageLoop()
+        Dim msg As MSG
+        Do
+            If PeekMessage(msg, 0, 0, 0, PM_REMOVE) Then
+                If msg.message = WM_QUIT Then Exit Do
+                TranslateMessage msg
+                DispatchMessage msg
+            Else
+                RenderFrame()
+            End If
+        Loop
+    End Sub
+
+    ' =========================================================================
+    ' D3D12 Initialisation
+    ' =========================================================================
+    Private Sub InitD3D12()
+        ' --- Debug layer (optional; remove for release builds) ---------------
+        Dim debugCtrl As ID3D12Debug
+        If SUCCEEDED(D3D12GetDebugInterface(IID_ID3D12Debug, debugCtrl)) Then
+            debugCtrl.EnableDebugLayer
+        End If
+
+        ' --- DXGI Factory -----------------------------------------------------
+        Dim factory As IDXGIFactory4
+        Dim hr As Long = CreateDXGIFactory2(0, IID_IDXGIFactory4, factory)
+        Debug.Print "CreWateDXGIFactory 0x" & Hex$(hr)
+
+        ' --- Hardware adapter -------------------------------------------------
+        Dim adapter As IDXGIAdapter1
+        Dim adapterIdx As Long
+        Do
+            factory.EnumAdapters1(adapterIdx, adapter)
+            If Err.LastHresult = DXGI_ERROR_NOT_FOUND Then
+                MsgBox "No D3D12-capable adapter found.", vbCritical: Exit Sub
+            End If
+            adapterIdx = adapterIdx + 1
+        Loop While FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, _
+                                            IID_ID3D12Device, m_Device))
+
+        ' --- Command queue ----------------------------------------------------
+        Dim qDesc As D3D12_COMMAND_QUEUE_DESC  ' all fields default to 0 = direct queue
+        m_Device.CreateCommandQueue qDesc, IID_ID3D12CommandQueue, m_CmdQueue
+
+        ' --- Swap chain -------------------------------------------------------
+        Dim scDesc As DXGI_SWAP_CHAIN_DESC1
+        scDesc.width = WINDOW_WIDTH
+        scDesc.Height = WINDOW_HEIGHT
+        scDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM
+        scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT
+        scDesc.BufferCount = FRAME_COUNT
+        scDesc.SampleDesc.Count = 1
+        scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD
+
+        Dim scTemp As IDXGISwapChain1
+        factory.CreateSwapChainForHwnd m_CmdQueue, m_hWnd, scDesc, ByVal vbNullPtr, Nothing, scTemp
+        factory.MakeWindowAssociation m_hWnd, DXGI_MWA_NO_ALT_ENTER
+        Set m_SwapChain = scTemp          ' QI to IDXGISwapChain3
+        m_FrameIndex = m_SwapChain.GetCurrentBackBufferIndex()
+
+        ' --- RTV descriptor heap ----------------------------------------------
+        Dim rtvHeapDesc As D3D12_DESCRIPTOR_HEAP_DESC
+        rtvHeapDesc.type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV
+        rtvHeapDesc.NumDescriptors = FRAME_COUNT
+        m_Device.CreateDescriptorHeap rtvHeapDesc, IID_ID3D12DescriptorHeap, m_RtvHeap
+        m_RtvDescSize = m_Device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
+
+        ' --- DSV descriptor heap ----------------------------------------------
+        Dim dsvHeapDesc As D3D12_DESCRIPTOR_HEAP_DESC
+        dsvHeapDesc.type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV
+        dsvHeapDesc.NumDescriptors = 1
+        m_Device.CreateDescriptorHeap dsvHeapDesc, IID_ID3D12DescriptorHeap, m_DsvHeap
+
+        ' --- Render target views ----------------------------------------------
+        Dim rtvHandle As D3D12_CPU_DESCRIPTOR_HANDLE
+        rtvHandle = m_RtvHeap.GetCPUDescriptorHandleForHeapStart()
+        Dim i As Long
+        For i = 0 To FRAME_COUNT - 1
+            m_SwapChain.GetBuffer i, IID_ID3D12Resource, m_RenderTargets(i)
+            m_Device.CreateRenderTargetView m_RenderTargets(i), ByVal vbNullPtr, rtvHandle
+            rtvHandle.Ptr = rtvHandle.Ptr + m_RtvDescSize
+            m_Device.CreateCommandAllocator D3D12_COMMAND_LIST_TYPE_DIRECT, _
+                IID_ID3D12CommandAllocator, m_CmdAllocators(i)
+        Next i
+
+        ' --- Depth buffer + DSV -----------------------------------------------
+        Dim depthDesc As D3D12_RESOURCE_DESC
+        depthDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        depthDesc.width = WINDOW_WIDTH
+        depthDesc.Height = WINDOW_HEIGHT
+        depthDesc.DepthOrArraySize = 1
+        depthDesc.MipLevels = 1
+        depthDesc.Format = DXGI_FORMAT_D32_FLOAT
+        depthDesc.SampleDesc.Count = 1
+        depthDesc.flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+
+        Dim clearVal As D3D12_CLEAR_VALUE
+        Dim DepthStencil As D3D12_DEPTH_STENCIL_VALUE
+        clearVal.Format = DXGI_FORMAT_D32_FLOAT
+        DepthStencil.Depth = 1.0!
+        DepthStencil.Stencil = 0
+        CopyMemory clearVal.ColorOrDepthStencilUnion(0), DepthStencil, LenB(DepthStencil)
+
+        Dim heapProp As D3D12_HEAP_PROPERTIES
+        heapProp.type = D3D12_HEAP_TYPE_DEFAULT
+        m_Device.CreateCommittedResource heapProp, D3D12_HEAP_FLAG_NONE, _
+            depthDesc, D3D12_RESOURCE_STATE_DEPTH_WRITE, clearVal, _
+            IID_ID3D12Resource, m_DepthBuffer
+
+        Dim dsvDesc As D3D12_DEPTH_STENCIL_VIEW_DESC
+        dsvDesc.Format = DXGI_FORMAT_D32_FLOAT
+        dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D
+        m_Device.CreateDepthStencilView m_DepthBuffer, dsvDesc, _
+            m_DsvHeap.GetCPUDescriptorHandleForHeapStart()
+
+        ' --- Command list -----------------------------------------------------
+        m_Device.CreateCommandList 0, D3D12_COMMAND_LIST_TYPE_DIRECT, _
+            m_CmdAllocators(0), Nothing, IID_ID3D12GraphicsCommandList, m_CmdList
+        m_CmdList.Close   ' close immediately; we re-open each frame
+
+        ' --- Fence + event ----------------------------------------------------
+        m_Device.CreateFence 0, D3D12_FENCE_FLAG_NONE, IID_ID3D12Fence, m_Fence
+        m_FenceEvent = CreateEvent(ByVal vbNullPtr, CFALSE, CFALSE, vbNullString)
+        Dim k As Long
+        For k = 0 To FRAME_COUNT - 1
+            m_FenceValues(k) = 0
+        Next k
+
+        ' --- Geometry, shaders, PSO -------------------------------------------
+        CreateRootSignatureAndPso
+        UploadGeometry
+        CreateConstantBuffers
+        
+        ' Dim i As Long
+        For i = 0 To FRAME_COUNT - 1
+            m_FenceValues(i) = m_Fence.GetCompletedValue()
+        Next i
+    End Sub
+
+    ' =========================================================================
+    ' Root Signature
+    ' =========================================================================
+    Private Sub CreateRootSignatureAndPso()
+        ' Root parameter: one CBV at b0, visible to all shader stages
+        Dim rootParam As D3D12_ROOT_PARAMETER
+        Dim Descriptor As D3D12_ROOT_DESCRIPTOR
+        rootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV
+        Descriptor.ShaderRegister = 0
+        Descriptor.RegisterSpace = 0
+        CopyMemory rootParam.RootUnion(0), Descriptor, LenB(Of D3D12_ROOT_DESCRIPTOR)
+        rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL
+
+        Dim rsDesc As D3D12_ROOT_SIGNATURE_DESC
+        rsDesc.NumParameters = 1
+        rsDesc.pParameters = VarPtr(rootParam)
+        rsDesc.flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+
+        Dim serialised As ID3DBlob
+        Dim errBlob    As ID3DBlob
+        D3D12SerializeRootSignature rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, serialised, errBlob
+        m_Device.CreateRootSignature 0, ByVal serialised.GetBufferPointer(), _
+            serialised.GetBufferSize(), IID_ID3D12RootSignature, m_RootSignature
+
+        ' --- Compile HLSL shaders ---------------------------------------------
+        Dim vsCode As String
+        vsCode = "cbuffer PerFrame : register(b0) { float4x4 gMVP; };" & vbLf & _
+                 "struct VSIn  { float3 pos : POSITION; float4 col : COLOR; };" & vbLf & _
+                 "struct VSOut { float4 pos : SV_POSITION; float4 col : COLOR; };" & vbLf & _
+                 "VSOut main(VSIn v) {" & vbLf & _
+                 "    VSOut o;" & vbLf & _
+                 "    o.pos = mul(float4(v.pos,1.0f), gMVP);" & vbLf & _
+                 "    o.col = v.col;" & vbLf & _
+                 "    return o;" & vbLf & _
+                 "}"
+        
+        Dim vsBlob As ID3DBlob, psBlob As ID3DBlob
+        Dim vsBytes() As Byte
+        vsBytes = StrConv(vsCode, vbFromUnicode)   ' UTF-16 -> ANSI/ASCII byte array
+
+        D3DCompile ByVal VarPtr(vsBytes(0)), UBound(vsBytes) + 1, "VS", ByVal vbNullPtr, ByVal vbNullPtr, _
+                   "main", "vs_5_0", _
+                   D3DCOMPILE_DEBUG Or D3DCOMPILE_SKIP_OPTIMIZATION, 0, vsBlob, errBlob
+        
+        Dim psCode As String
+        psCode = "struct PSIn { float4 pos : SV_POSITION; float4 col : COLOR; };" & vbLf & _
+                 "float4 main(PSIn p) : SV_TARGET { return p.col; }"
+
+        Dim psBytes() As Byte
+        psBytes = StrConv(psCode, vbFromUnicode)
+
+        D3DCompile ByVal VarPtr(psBytes(0)), UBound(psBytes) + 1, "PS", ByVal vbNullPtr, ByVal vbNullPtr, _
+                   "main", "ps_5_0", _
+                   D3DCOMPILE_DEBUG Or D3DCOMPILE_SKIP_OPTIMIZATION, 0, psBlob, errBlob
+
+        ' --- Input layout -----------------------------------------------------
+        Dim layout(1) As D3D12_INPUT_ELEMENT_DESC
+        
+        m_SemanticPosition = StrConv("POSITION", vbFromUnicode)
+        m_SemanticColor = StrConv("COLOR", vbFromUnicode)
+        layout(0).SemanticName = StrPtr(m_SemanticPosition)
+        layout(0).Format = DXGI_FORMAT_R32G32B32_FLOAT
+        layout(0).InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA
+        layout(1).SemanticName = StrPtr(m_SemanticColor)
+        layout(1).Format = DXGI_FORMAT_R32G32B32A32_FLOAT
+        layout(1).AlignedByteOffset = 12   ' after xyz
+        layout(1).InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA
+
+        ' --- PSO descriptor ---------------------------------------------------
+        Dim psoDesc As D3D12_GRAPHICS_PIPELINE_STATE_DESC
+        Set psoDesc.pRootSignature = m_RootSignature
+        psoDesc.VS.pShaderBytecode = vsBlob.GetBufferPointer()
+        psoDesc.VS.BytecodeLength = vsBlob.GetBufferSize()
+        psoDesc.PS.pShaderBytecode = psBlob.GetBufferPointer()
+        psoDesc.PS.BytecodeLength = psBlob.GetBufferSize()
+        psoDesc.InputLayout.pInputElementDescs = VarPtr(layout(0))
+        psoDesc.InputLayout.NumElements = 2
+        psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+        psoDesc.NumRenderTargets = 1
+        psoDesc.RTVFormats(0) = DXGI_FORMAT_R8G8B8A8_UNORM
+        psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT
+        psoDesc.SampleDesc.Count = 1
+        psoDesc.SampleMask = &HFFFFFFFF
+
+        ' Default rasteriser: fill, cull back, CCW front
+        psoDesc.RasterizerState.fillMode = D3D12_FILL_MODE_SOLID
+        psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK
+        psoDesc.RasterizerState.FrontCounterClockwise = 0
+
+        ' Default depth-stencil: depth test enabled, write enabled
+        psoDesc.DepthStencilState.DepthEnable = 1
+        psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL
+        psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS
+
+        ' Default blend: no blending
+        psoDesc.BlendState.renderTarget(0).RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL
+        
+         
+        On Error Resume Next
+        m_Device.CreateGraphicsPipelineState psoDesc, IID_ID3D12PipelineState, m_Pso
+    End Sub
+
+    ' =========================================================================
+    ' Geometry upload  (vertex + index buffers, upload heap -> default heap)
+    ' =========================================================================
+    Private Sub UploadGeometry()
+        '
+        ' Unit cube: 8 vertices, each face a distinct colour.
+        '   +X=right  +Y=up  +Z=forward (left-handed)
+        '
+        Dim verts(7) As Vertex
+        ' Bottom face  (y = -0.5)
+        verts(0).x = -0.5!: verts(0).y = -0.5!: verts(0).z = -0.5!: verts(0).r = 1!: verts(0).g = 0!: verts(0).b = 0!: verts(0).a = 1!
+        verts(1).x = 0.5!: verts(1).y = -0.5!: verts(1).z = -0.5!: verts(1).r = 0!: verts(1).g = 1!: verts(1).b = 0!: verts(1).a = 1!
+        verts(2).x = 0.5!: verts(2).y = -0.5!: verts(2).z = 0.5!: verts(2).r = 0!: verts(2).g = 0!: verts(2).b = 1!: verts(2).a = 1!
+        verts(3).x = -0.5!: verts(3).y = -0.5!: verts(3).z = 0.5!: verts(3).r = 1!: verts(3).g = 1!: verts(3).b = 0!: verts(3).a = 1!
+        ' Top face    (y = +0.5)
+        verts(4).x = -0.5!: verts(4).y = 0.5!: verts(4).z = -0.5!: verts(4).r = 0!: verts(4).g = 1!: verts(4).b = 1!: verts(4).a = 1!
+        verts(5).x = 0.5!: verts(5).y = 0.5!: verts(5).z = -0.5!: verts(5).r = 1!: verts(5).g = 0!: verts(5).b = 1!: verts(5).a = 1!
+        verts(6).x = 0.5!: verts(6).y = 0.5!: verts(6).z = 0.5!: verts(6).r = 1!: verts(6).g = 0.5!: verts(6).b = 0!: verts(6).a = 1!
+        verts(7).x = -0.5!: verts(7).y = 0.5!: verts(7).z = 0.5!: verts(7).r = 0.5!: verts(7).g = 0!: verts(7).b = 0.5!: verts(7).a = 1!
+
+        ' 12 triangles = 36 indices (two per face)
+        Dim idx(35) As Integer
+        ' ' Bottom (-Y) 
+        idx(0) = 0: idx(1) = 1: idx(2) = 2
+        idx(3) = 0: idx(4) = 2: idx(5) = 3
+        ' Top (+Y), viewed from above, normal pointing up
+        idx(6) = 4: idx(7) = 6: idx(8) = 5
+        idx(9) = 4: idx(10) = 7: idx(11) = 6
+        ' Front (+Z), viewed from front, normal pointing toward viewer
+        idx(12) = 3: idx(13) = 2: idx(14) = 6
+        idx(15) = 3: idx(16) = 6: idx(17) = 7
+        ' Back (-Z), viewed from back
+        idx(18) = 0: idx(19) = 5: idx(20) = 1
+        idx(21) = 0: idx(22) = 4: idx(23) = 5
+        ' Right (+X), viewed from right
+        idx(24) = 1: idx(25) = 5: idx(26) = 6
+        idx(27) = 1: idx(28) = 6: idx(29) = 2
+        ' Left (-X), viewed from left
+        idx(30) = 0: idx(31) = 3: idx(32) = 7
+        idx(33) = 0: idx(34) = 7: idx(35) = 4
+        
+        
+        Dim vbSize As Long: vbSize = LenB(verts(0)) * 8
+        Dim ibSize As Long: ibSize = LenB(idx(0)) * 36
+
+        ' Helper: create an upload-heap resource and copy data into it,
+        ' then schedule a copy to a default-heap resource.
+        Set m_VertexBuffer = CreateAndUploadBuffer(VarPtr(verts(0)), vbSize, _
+                                               D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)
+        Set m_IndexBuffer = CreateAndUploadBuffer(VarPtr(idx(0)), ibSize, _
+                                               D3D12_RESOURCE_STATE_INDEX_BUFFER)
+    End Sub
+
+    ' Helper – creates a GPU default buffer and uploads data from CPU memory via
+    ' an intermediate upload heap, submitting and waiting on the copy queue.
+    Private Function CreateAndUploadBuffer(pData As LongPtr, byteSize As Long, _
+                                           finalState As Long) As ID3D12Resource
+        Dim heapPropUpload As D3D12_HEAP_PROPERTIES
+        heapPropUpload.type = D3D12_HEAP_TYPE_UPLOAD
+
+        Dim heapPropDefault As D3D12_HEAP_PROPERTIES
+        heapPropDefault.type = D3D12_HEAP_TYPE_DEFAULT
+
+        Dim resDesc As D3D12_RESOURCE_DESC
+        resDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER
+        resDesc.width = byteSize
+        resDesc.Height = 1
+        resDesc.DepthOrArraySize = 1
+        resDesc.MipLevels = 1
+        resDesc.SampleDesc.Count = 1
+        resDesc.LayOut = D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+
+        ' Upload heap (CPU-writable)
+        Dim uploadBuf As ID3D12Resource
+        m_Device.CreateCommittedResource heapPropUpload, D3D12_HEAP_FLAG_NONE, _
+            resDesc, D3D12_RESOURCE_STATE_GENERIC_READ, ByVal vbNullPtr, _
+            IID_ID3D12Resource, uploadBuf
+
+        ' Default heap (GPU-local, final home)
+        Dim defaultBuf As ID3D12Resource
+        m_Device.CreateCommittedResource heapPropDefault, D3D12_HEAP_FLAG_NONE, _
+            resDesc, D3D12_RESOURCE_STATE_COPY_DEST, ByVal vbNullPtr, _
+            IID_ID3D12Resource, defaultBuf
+
+        ' Map, memcpy, unmap
+        Dim mappedPtr As LongPtr
+        uploadBuf.Map 0, ByVal vbNullPtr, mappedPtr
+        CopyMemory ByVal mappedPtr, ByVal pData, byteSize
+        uploadBuf.Unmap 0, ByVal vbNullPtr
+
+        ' Record and submit a copy command
+        m_CmdAllocators(0).Reset
+        m_CmdList.Reset m_CmdAllocators(0), Nothing
+        m_CmdList.CopyResource defaultBuf, uploadBuf
+
+        ' Transition to final state
+        Dim barrier As D3D12_RESOURCE_BARRIER
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION
+        Dim transition As D3D12_RESOURCE_TRANSITION_BARRIER
+        Set transition.pResource = defaultBuf
+        transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST
+        transition.StateAfter = finalState
+        transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
+        CopyMemory barrier.ResourceUnion(0), transition, LenB(Of D3D12_RESOURCE_TRANSITION_BARRIER)
+        m_CmdList.ResourceBarrier 1, barrier
+
+        m_CmdList.Close
+        m_CmdQueue.ExecuteCommandLists 1, m_CmdList
+        WaitForGpu
+
+        Set CreateAndUploadBuffer = defaultBuf
+    End Function
+
+    ' =========================================================================
+    ' Constant buffers – persistently mapped (one per frame)
+    ' =========================================================================
+    Private Sub CreateConstantBuffers()
+        Dim cbSize As Long: cbSize = 256  ' D3D12 requires 256-byte alignment for CBVs
+
+        Dim heapProp As D3D12_HEAP_PROPERTIES
+        heapProp.type = D3D12_HEAP_TYPE_UPLOAD
+
+        Dim resDesc As D3D12_RESOURCE_DESC
+        resDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER
+        resDesc.width = cbSize
+        resDesc.Height = 1
+        resDesc.DepthOrArraySize = 1
+        resDesc.MipLevels = 1
+        resDesc.SampleDesc.Count = 1
+        resDesc.LayOut = D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+
+        Dim i As Long
+        For i = 0 To FRAME_COUNT - 1
+            m_Device.CreateCommittedResource heapProp, D3D12_HEAP_FLAG_NONE, _
+                resDesc, D3D12_RESOURCE_STATE_GENERIC_READ, ByVal vbNullPtr, _
+                IID_ID3D12Resource, m_ConstantBuffers(i)
+            ' Keep mapped for the lifetime of the app (write-combine memory)
+            m_ConstantBuffers(i).Map 0, ByVal vbNullPtr, m_CbMappedPtr(i)
+        Next i
+    End Sub
+
+    ' =========================================================================
+    ' Per-frame rendering
+    ' =========================================================================
+    Private Sub RenderFrame()
+        m_RotationAngle = m_RotationAngle + 0.01!
+        If m_RotationAngle > 2! * CSng(PI) Then m_RotationAngle = m_RotationAngle - 2! * CSng(PI)
+
+        ' Build MVP and write to constant buffer
+        UpdateConstantBuffer
+
+        ' --- Record command list ----------------------------------------------
+        m_CmdAllocators(m_FrameIndex).Reset
+        m_CmdList.Reset m_CmdAllocators(m_FrameIndex), m_Pso
+
+        ' Transition back-buffer: Present -> RenderTarget
+        Dim barrierToRT As D3D12_RESOURCE_BARRIER
+        barrierToRT.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION
+        Dim transition As D3D12_RESOURCE_TRANSITION_BARRIER
+        Set transition.pResource = m_RenderTargets(m_FrameIndex)
+        transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT
+        transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET
+        transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
+        CopyMemory barrierToRT.ResourceUnion(0), transition, LenB(Of D3D12_RESOURCE_TRANSITION_BARRIER)
+        m_CmdList.ResourceBarrier 1, barrierToRT
+
+        ' RTV handle for current back-buffer
+        Dim rtvHandle As D3D12_CPU_DESCRIPTOR_HANDLE
+        rtvHandle = m_RtvHeap.GetCPUDescriptorHandleForHeapStart()
+        rtvHandle.Ptr = rtvHandle.Ptr + CLngPtr(m_FrameIndex) * m_RtvDescSize
+
+        Dim dsvHandle As D3D12_CPU_DESCRIPTOR_HANDLE
+        dsvHandle = m_DsvHeap.GetCPUDescriptorHandleForHeapStart()
+
+        ' Clear
+        Dim clearColor(3) As Single
+        clearColor(0) = 0.1!: clearColor(1) = 0.1!: clearColor(2) = 0.15!: clearColor(3) = 1.0!
+        m_CmdList.ClearRenderTargetView rtvHandle, clearColor(0), 0, ByVal vbNullPtr
+        m_CmdList.ClearDepthStencilView dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0!, 0, 0, ByVal vbNullPtr
+
+        ' Set render target
+        m_CmdList.OMSetRenderTargets 1, rtvHandle, 0, dsvHandle
+
+        ' Viewport and scissor
+        Dim vp As D3D12_VIEWPORT
+        vp.width = WINDOW_WIDTH
+        vp.Height = WINDOW_HEIGHT
+        vp.MinDepth = 0.0!
+        vp.MaxDepth = 1.0!
+        m_CmdList.RSSetViewports 1, vp
+
+        Dim sr As RECT 'D3D12_RECT
+        sr.Right = WINDOW_WIDTH
+        sr.Bottom = WINDOW_HEIGHT
+        m_CmdList.RSSetScissorRects 1, sr
+
+        ' Root signature & CBV
+        m_CmdList.SetGraphicsRootSignature m_RootSignature
+        m_CmdList.SetGraphicsRootConstantBufferView 0, _
+            m_ConstantBuffers(m_FrameIndex).GetGPUVirtualAddress()
+
+        ' Vertex / index buffers
+        Dim vbv As D3D12_VERTEX_BUFFER_VIEW
+        vbv.BufferLocation = m_VertexBuffer.GetGPUVirtualAddress()
+        vbv.SizeInBytes = 28 * 8   ' sizeof(Vertex) * 8
+        vbv.StrideInBytes = 28
+        m_CmdList.IASetVertexBuffers 0, 1, vbv
+
+        Dim ibv As D3D12_INDEX_BUFFER_VIEW
+        ibv.BufferLocation = m_IndexBuffer.GetGPUVirtualAddress()
+        ibv.SizeInBytes = 2 * 36   ' sizeof(Integer) * 36
+        ibv.Format = DXGI_FORMAT_R16_UINT
+        m_CmdList.IASetIndexBuffer ibv
+
+        m_CmdList.IASetPrimitiveTopology D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+
+        ' Draw
+        m_CmdList.DrawIndexedInstanced 36, 1, 0, 0, 0
+
+        ' Transition back-buffer: RenderTarget -> Present
+        Dim barrierToPresent As D3D12_RESOURCE_BARRIER
+        barrierToPresent.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION
+        Dim transition2 As D3D12_RESOURCE_TRANSITION_BARRIER
+        Set transition2.pResource = m_RenderTargets(m_FrameIndex)
+        transition2.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET
+        transition2.StateAfter = D3D12_RESOURCE_STATE_PRESENT
+        transition2.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
+        CopyMemory barrierToPresent.ResourceUnion(0), transition2, LenB(Of D3D12_RESOURCE_TRANSITION_BARRIER)
+        
+        m_CmdList.ResourceBarrier 1, barrierToPresent
+
+        m_CmdList.Close
+
+        ' --- Submit -----------------------------------------------------------
+        m_CmdQueue.ExecuteCommandLists 1, m_CmdList
+
+        ' --- Present ----------------------------------------------------------
+        m_SwapChain.Present 1, 0   ' vsync on
+
+        ' --- Advance fence for this frame ------------------------------------
+        m_FenceValues(m_FrameIndex) = m_FenceValues(m_FrameIndex) + 1
+        m_CmdQueue.Signal m_Fence, m_FenceValues(m_FrameIndex)
+
+        ' Move to next frame
+        m_FrameIndex = m_SwapChain.GetCurrentBackBufferIndex()
+
+        ' If the next frame's allocator is still in-flight, wait
+        If m_Fence.GetCompletedValue() < m_FenceValues(m_FrameIndex) Then
+            m_Fence.SetEventOnCompletion m_FenceValues(m_FrameIndex), m_FenceEvent
+            WaitForSingleObjectEx m_FenceEvent, INFINITE, False
+        End If
+    End Sub
+
+    ' =========================================================================
+    ' Matrix math & constant buffer update
+    ' =========================================================================
+
+    ' Builds a column-major 4x4 identity matrix 
+    Private Sub MatIdentity(m() As Single)
+        Dim r As Integer, c As Integer
+        For r = 0 To 3: For c = 0 To 3
+            m(c, r) = IIf(r = c, 1.0!, 0.0!)
+        Next c: Next r
+    End Sub
+    
+    ' Rotation around Y axis (angle in radians)
+ 
+    Private Sub MatRotationY(m() As Single, angle As Single)
+        MatIdentity m
+        m(0, 0) = Cos(angle)
+        m(2, 0) = Sin(angle)   ' note: LH convention
+        m(0, 2) = -Sin(angle)
+        m(2, 2) = Cos(angle)
+    End Sub
+
+    Private Sub MatRotationX(m() As Single, angle As Single)
+        MatIdentity m
+        m(1, 1) = Cos(angle)
+        m(2, 1) = -Sin(angle)   ' note: LH convention
+        m(1, 2) = Sin(angle)
+        m(2, 2) = Cos(angle)
+    End Sub
+    Private Sub MatMul(out() As Single, a() As Single, b() As Single)
+        Dim r As Integer, c As Integer, k As Integer
+        Dim res(3, 3) As Single
+        For r = 0 To 3
+            For c = 0 To 3
+                Dim tmp As Single: tmp = 0.0!
+                For k = 0 To 3
+                    tmp = tmp + a(k, r) * b(c, k)
+                Next k
+                res(c, r) = tmp
+            Next c
+        Next r
+        For r = 0 To 3: For c = 0 To 3
+            out(c, r) = res(c, r)
+        Next c: Next r
+    End Sub
+    Private Sub MatPerspectiveFovLH(m() As Single, fovY As Single, _
+        aspect As Single, nearZ As Single, farZ As Single)
+        Dim f As Single: f = 1.0! / Tan(fovY * 0.5!)
+        MatIdentity m
+        ' Column-major layout: m(col, row)
+        m(0, 0) = f / aspect                          ' X scale
+        m(1, 1) = f                                   ' Y scale
+        m(2, 2) = farZ / (farZ - nearZ)               ' Z scale
+        m(3, 2) = (-nearZ * farZ) / (farZ - nearZ)    ' Z translation (col 3, row 2)
+        m(2, 3) = 1.0!                                ' W = Z (col 2, row 3)
+        m(3, 3) = 0.0!
+    End Sub
+    ' Simple "look-at" translation: move world back along Z 
+    Private Sub MatTranslation(m() As Single, tx As Single, ty As Single, tz As Single)
+        MatIdentity m
+        m(3, 0) = tx
+        m(3, 1) = ty
+        m(3, 2) = tz
+    End Sub
+     
+    Private Sub MatLookAtLH(m() As Single, _
+        eyeX As Single, eyeY As Single, eyeZ As Single, _
+        atX As Single, atY As Single, atZ As Single, _
+        upX As Single, upY As Single, upZ As Single)
+        ' Forward = normalize(at - eye)
+        Dim fX As Single, fY As Single, fZ As Single
+        fX = atX - eyeX: fY = atY - eyeY: fZ = atZ - eyeZ
+        Dim fLen As Single: fLen = Sqr(fX * fX + fY * fY + fZ * fZ)
+        fX = fX / fLen: fY = fY / fLen: fZ = fZ / fLen
+
+        ' Right = normalize(forward cross up)
+        Dim rX As Single, rY As Single, rZ As Single
+        rX = fY * upZ - fZ * upY
+        rY = fZ * upX - fX * upZ
+        rZ = fX * upY - fY * upX
+        Dim rLen As Single: rLen = Sqr(rX * rX + rY * rY + rZ * rZ)
+        rX = rX / rLen: rY = rY / rLen: rZ = rZ / rLen
+
+        ' Up = forward cross right (reorthogonalised)
+        Dim uX As Single, uY As Single, uZ As Single
+        uX = rY * fZ - rZ * fY
+        uY = rZ * fX - rX * fZ
+        uZ = rX * fY - rY * fX
+
+        ' Column-major layout: m(col, row)
+        ' Row 0: right
+        m(0, 0) = rX: m(1, 0) = rY: m(2, 0) = rZ: m(3, 0) = -(rX * eyeX + rY * eyeY + rZ * eyeZ)
+        ' Row 1: up
+        m(0, 1) = uX: m(1, 1) = uY: m(2, 1) = uZ: m(3, 1) = -(uX * eyeX + uY * eyeY + uZ * eyeZ)
+        ' Row 2: forward
+        m(0, 2) = fX: m(1, 2) = fY: m(2, 2) = fZ: m(3, 2) = -(fX * eyeX + fY * eyeY + fZ * eyeZ)
+        ' Row 3: homogeneous
+        m(0, 3) = 0.0!: m(1, 3) = 0.0!: m(2, 3) = 0.0!: m(3, 3) = 1.0!
+    End Sub
+
+    Private Sub UpdateConstantBuffer()
+        Dim angle  As Single: angle = m_RotationAngle
+        Dim angleX As Single: angleX = m_RotationAngle * 0.4!
+
+        Dim rotY(3, 3) As Single
+        rotY(0, 0) = Cos(angle): rotY(1, 0) = 0.0!: rotY(2, 0) = -Sin(angle): rotY(3, 0) = 0.0!
+        rotY(0, 1) = 0.0!: rotY(1, 1) = 1.0!: rotY(2, 1) = 0.0!: rotY(3, 1) = 0.0!
+        rotY(0, 2) = Sin(angle): rotY(1, 2) = 0.0!: rotY(2, 2) = Cos(angle): rotY(3, 2) = 0.0!
+        rotY(0, 3) = 0.0!: rotY(1, 3) = 0.0!: rotY(2, 3) = 0.0!: rotY(3, 3) = 1.0!
+
+        Dim rotX(3, 3) As Single
+        rotX(0, 0) = 1.0!: rotX(1, 0) = 0.0!: rotX(2, 0) = 0.0!: rotX(3, 0) = 0.0!
+        rotX(0, 1) = 0.0!: rotX(1, 1) = Cos(angleX): rotX(2, 1) = Sin(angleX): rotX(3, 1) = 0.0!
+        rotX(0, 2) = 0.0!: rotX(1, 2) = -Sin(angleX): rotX(2, 2) = Cos(angleX): rotX(3, 2) = 0.0!
+        rotX(0, 3) = 0.0!: rotX(1, 3) = 0.0!: rotX(2, 3) = 0.0!: rotX(3, 3) = 1.0!
+
+        Dim model(3, 3) As Single
+        MatMul model, rotX, rotY
+
+        Dim view(3, 3) As Single
+        view(0, 0) = 1.0!: view(1, 0) = 0.0!: view(2, 0) = 0.0!: view(3, 0) = 0.0!
+        view(0, 1) = 0.0!: view(1, 1) = 1.0!: view(2, 1) = 0.0!: view(3, 1) = 0.0!
+        view(0, 2) = 0.0!: view(1, 2) = 0.0!: view(2, 2) = 1.0!: view(3, 2) = 3.0!
+        view(0, 3) = 0.0!: view(1, 3) = 0.0!: view(2, 3) = 0.0!: view(3, 3) = 1.0!
+
+        Dim proj(3, 3) As Single
+        proj(0, 0) = 1.358!: proj(1, 0) = 0.0!: proj(2, 0) = 0.0!: proj(3, 0) = 0.0!
+        proj(0, 1) = 0.0!: proj(1, 1) = 2.414!: proj(2, 1) = 0.0!: proj(3, 1) = 0.0!
+        proj(0, 2) = 0.0!: proj(1, 2) = 0.0!: proj(2, 2) = 1.001!: proj(3, 2) = -0.100!
+        proj(0, 3) = 0.0!: proj(1, 3) = 0.0!: proj(2, 3) = 1.0!: proj(3, 3) = 0.0!
+
+        Dim mv(3, 3)  As Single
+        Dim mvp(3, 3) As Single
+        MatMul mv, view, model
+        MatMul mvp, proj, mv
+
+        CopyMemory ByVal m_CbMappedPtr(m_FrameIndex), mvp(0, 0), 64
+    End Sub
+    ' =========================================================================
+    ' GPU synchronisation helpers
+    ' =========================================================================
+
+    ' Flush all pending GPU work and wait for completion
+    Private Sub WaitForGpu()
+        Dim signalValue As LongLong
+        signalValue = m_FenceValues(m_FrameIndex) + 1
+        m_CmdQueue.Signal m_Fence, signalValue
+        m_Fence.SetEventOnCompletion signalValue, m_FenceEvent
+        WaitForSingleObjectEx m_FenceEvent, INFINITE, False
+        m_FenceValues(m_FrameIndex) = signalValue
+    End Sub
+
+End Module
+    
