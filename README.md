@@ -6,3 +6,7 @@ Using D3D12 with HLSL shaders in twinBASIC
 This just draws a cube but it's a fairly deep intro dive into Direct3D 12.
 
 **Requires Windows Development Library for twinBASIC v9.3.676 or newer**
+
+DX12CubeDemo.twinproj - Uses custom window
+
+DX12CubeDemoFrm.twinproj - Uses standard Form
