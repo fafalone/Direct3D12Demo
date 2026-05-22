@@ -10,3 +10,8 @@ This just draws a cube but it's a fairly deep intro dive into Direct3D 12.
 DX12CubeDemo.twinproj - Uses custom window
 
 DX12CubeDemoFrm.twinproj - Uses standard Form
+
+
+**UPDATE**
+
+I've added a second sample. This demo combines the cube with XInput: the cube is moved by the D-pad and rotated by the left stick.
