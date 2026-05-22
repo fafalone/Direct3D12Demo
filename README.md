@@ -14,7 +14,7 @@ DX12CubeDemoFrm.twinproj - Uses standard Form
 
 **UPDATE**
 
-I've added a second sample. This demo the cube movemovement and rotation are controlled by user input with two options:
+I've added a second sample - DX12CubeDemoWithInput.twinproj. This demo the cube movement and rotation are controlled by user input with two options:
 
 XInput: The cube is moved by the D-pad and rotated by the left stick.
 
